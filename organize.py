@@ -45,10 +45,10 @@ def main(root_path='./'):
     release_metainfo_paths = {}
 
     for path in all_files:
-        print(path)
+        print("processing", path)
 
-        data = try_bdecode(open(path, 'rb').read())
-        if data and 'info' in data:
+        if path.lower().endswith('.torrent'):
+            data = bdecode(open(path, 'rb').read())
             info = data['info']
             try:
                 info_encoded = bencode(info)
@@ -150,13 +150,6 @@ class ReleaseDescription(collections.namedtuple('ReleaseDescription', '''
         return releases
 
 
-def try_bdecode(data):
-    try:
-        return bdecode(data)
-    except BencodeDecodeError:
-        return None
-
-
 def bdecode(data):
     if not isinstance(data, bytes):
         raise TypeError("can only bdecode bytes, not %s" % (type(data),))
@@ -171,7 +164,7 @@ def bdecode(data):
         elif b'd' == first_byte:
             result, next_index = decode_dict(start_index)
         elif b'i' == first_byte:
-            result, next_index = decode_dict(start_index)
+            result, next_index = decode_int(start_index)
         elif b'0' <= first_byte <= b'9':
             result, next_index = decode_string(start_index)
         else:
@@ -197,19 +190,20 @@ def bdecode(data):
 
     def decode_string(start_index):
         colon_index = data.index(b':', start_index)
+        value_start_index = colon_index + 1
 
         if data[start_index] == b'0' and colon_index - start_index > 1:
             raise BencodeDecodeError("unexpected leading zero in string length")
 
         value_length = int(data[start_index:colon_index])
 
-        value = data[colon_index:colon_index + value_length]
+        value = data[value_start_index:value_start_index + value_length]
 
         if len(value) != value_length:
             raise BencodeDecodeError(
-                "expected %s bytes for string, but only %s bytes remained" % (value_length, len(value)))
+                "expected %s bytes for string, but only %s bytes remained, starting with %r" % (value_length, len(value), value[:4]))
 
-        next_index = colon_index + value_length
+        next_index = value_start_index + value_length
         return value, next_index
 
     def decode_list(start_index):
@@ -218,7 +212,14 @@ def bdecode(data):
         value = []
         
         while data[child_index] != b'e':
-            child_value, child_index = decode_any(child_index)
+            try:
+                child_value, child_index = decode_any(child_index)
+            except BencodeDecodeError as ex:
+                ex.args += ("while trying to parse list child with index %s" % (len(value),),)
+                raise
+            except ValueError as ex:
+                raise BencodeDecodeError(ex, ("while trying to parse list child with index %s" % (len(value),),))
+
             value.append(child_value)
 
         next_index = child_index + 1
@@ -229,9 +230,31 @@ def bdecode(data):
 
         value = {}
         
+        previous_key = None
+
         while data[child_index] != b'e':
-            child_key, child_index = decode_string(child_index)
-            child_value, child_index = decode_any(child_index)
+            try:
+                child_key, child_index = decode_string(child_index)
+            except BencodeDecodeError as ex:
+                ex.args += ("while trying to parse dict key with index %s" % (len(value),),)
+                raise
+            except ValueError as ex:
+                raise BencodeDecodeError(ex, "while trying to parse dict key with index %s" % (len(value),))
+
+            try:
+                child_value, child_index = decode_any(child_index)
+            except BencodeDecodeError as ex:
+                ex.args += ("while trying to parse dict value for key %r with index %s" % (child_key, len(value),),)
+                raise
+            except ValueError as ex:
+                raise BencodeDecodeError(ex, "while trying to parse dict value for key %r with index %s" % (child_key, len(value),))
+
+            if previous_key is not None:
+                if not (previous_key < child_key):
+                    raise BencodeDecodeError("got out-of-order key %r after %r" % (child_key, previous_key))
+
+            previous_key = child_key
+
             value[child_key] = child_value
 
         next_index = child_index + 1
@@ -249,7 +272,8 @@ def bdecode(data):
 
 
 class BencodeDecodeError(ValueError):
-    pass
+    def __str__(self):
+        return 'BencodeDecodeError(\n    %s)' % ',\n    '.join(repr(a) for a in self.args)
 
 
 def bencode(root_value):
