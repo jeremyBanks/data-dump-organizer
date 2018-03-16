@@ -17,7 +17,6 @@ import gzip
 import hashlib
 import json
 import os
-import pprint
 import re
 import StringIO
 import sys
@@ -27,6 +26,12 @@ import urllib2
 def main(root_path='./'):    
     root_path = os.path.abspath(root_path)
     rel_path = lambda *a: os.path.join(root_path, *a)
+
+    missing = open(rel_path('missing.txt'), 'wt')
+    missing.write("Missing data:\n")
+    def write_missing(s):
+        missing.write(s)
+        sys.stderr.write(s)
 
     all_files = []
     for dirpath, dirnames, filenames in os.walk(root_path):
@@ -40,14 +45,14 @@ def main(root_path='./'):
     release_metainfo_paths = {}
 
     for path in all_files:
-        pp(path)
+        print(path)
 
         data = try_bdecode(open(path, 'rb').read())
         if data and 'info' in data:
             info = data['info']
             try:
                 info_encoded = bencode(info)
-            except SyntaxError as ex:
+            except BencodeDecodeError as ex:
                 print(ex)
                 continue
             infohash = hashlib.sha1(info_encoded).hexdigest()
@@ -59,7 +64,6 @@ def main(root_path='./'):
             release_metainfo_paths[infohash] = path
     
     for infohash in release_metainfo_paths:
-        
         if infohash in releases_descriptions:
             is_release = True
             description = releases_descriptions[infohash]
@@ -73,6 +77,7 @@ def main(root_path='./'):
             length = info['length']
         else:
             length = sum(f['length'] for f in info['files'])
+
         name = info['name']
 
         if is_release:
@@ -81,50 +86,16 @@ def main(root_path='./'):
             prefix_path = 'unrecognized-torrents'
 
         target_path = rel_path(prefix_path, '-'.join([
-            '%08x' % length,
+            '%010x' % (length),
             re.sub(r'[^0-9a-z]+', '_', name.lower()).strip('_') or 'unknown',
             infohash
         ]), 'metainfo.torrent')
 
         os.renames(path, target_path)
 
-
-def try_bdecode(b):
-    """Bencoding-decodes bytes into a JSON-like structure.
-
-    Returns None if by is not a valid bencoded value.
-    """
-
-    return bdecode(b)
-
-    try:
-        result = bdecode(b)
-        if isinstance(result, dict):
-            return result
-    except SyntaxError:
-        pass
-
-
-
-def pp(*things):
-    for thing in things:
-        pprint.pprint(thing)
-
-
-"""
-Output?
-
-/missing.txt
-/${4-byte hex encoding of file size}-${torrent name}-${4-byte prefix of infohash}/
-        metainfo.torrent
-        data/${torrent name}*
-unknown/* # everything else thrown in here, preserving rest of relative path.
-
-00ffffff-e73b7025-stackexchange/e73b7025a2af72124ae49d184fa3e8cec3f66016.torrent
-e73b70-stackexchange/e73b7025a2af72124ae49d184fa3e8cec3f66016.torrent
-
-
-"""
+    for infohash in set(releases_descriptions) - set(release_metainfo_paths):
+        description = releases_descriptions[infohash]
+        write_missing(" - metainfo file for %s.\n" % (description, ))
 
 
 class ReleaseDescription(collections.namedtuple('ReleaseDescription', '''
@@ -179,105 +150,148 @@ class ReleaseDescription(collections.namedtuple('ReleaseDescription', '''
         return releases
 
 
+def try_bdecode(data):
+    try:
+        return bdecode(data)
+    except BencodeDecodeError:
+        return None
 
 
+def bdecode(data):
+    if not isinstance(data, bytes):
+        raise TypeError("can only bdecode bytes, not %s" % (type(data),))
 
-def bdecode(x):
-    def decode_int(x, f):
-        f += 1
-        newf = x.index(b'e', f)
-        n = int(x[f:newf])
-        if x[f] == b'-':
-            if x[f + 1] == b'0':
-                raise SyntaxError("got %r expecting %r" % (x[f + 1], b'0'))
-        elif x[f] == b'0' and newf != f+1:
-            raise SyntaxError("got invalid leading zero in integer")
-        return (n, newf+1)
+    def decode_any(start_index):
+        first_byte = data[start_index:start_index + 1]
 
-    def decode_string(x, f):
-        colon = x.index(b':', f)
-        n = int(x[f:colon])
-        if x[f] == b'0' and colon != f+1:
-            raise SyntaxError("got invalid leading zero in string length")
-        colon += 1
-        return (x[colon:colon+n], colon+n)
-
-    def decode_list(x, f):
-        r, f = [], f+1
-        while x[f] != b'e':
-            v, f = decode_func[x[f]](x, f)
-            r.append(v)
-        return (r, f + 1)
-
-    def decode_dict(x, f):
-        r, f = {}, f+1
-        while x[f] != b'e':
-            k, f = decode_string(x, f)
-            r[k], f = decode_func[x[f]](x, f)
-        return (r, f + 1)
-
-    decode_func = {}
-    decode_func[b'l'] = decode_list
-    decode_func[b'd'] = decode_dict
-    decode_func[b'i'] = decode_int
-    decode_func[b'0'] = decode_string
-    decode_func[b'1'] = decode_string
-    decode_func[b'2'] = decode_string
-    decode_func[b'3'] = decode_string
-    decode_func[b'4'] = decode_string
-    decode_func[b'5'] = decode_string
-    decode_func[b'6'] = decode_string
-    decode_func[b'7'] = decode_string
-    decode_func[b'8'] = decode_string
-    decode_func[b'9'] = decode_string
-
-    r, l = decode_func[x[0]](x, 0)
-
-    if l != len(x):
-        raise SyntaxError("invalid bencoded value (data after valid prefix)")
-    return r
-
-def bencode(x):
-    def encode_int(x, r):
-        r.extend((b'i', str(x).encode('ascii'), b'e'))
-
-    def encode_bool(x, r):
-        if x:
-            encode_int(1, r)
+        if not first_byte:
+            raise BencodeDecodeError("got end of data, expecting beginning of bencoded value")
+        elif b'l' == first_byte:
+            result, next_index = decode_list(start_index)
+        elif b'd' == first_byte:
+            result, next_index = decode_dict(start_index)
+        elif b'i' == first_byte:
+            result, next_index = decode_dict(start_index)
+        elif b'0' <= first_byte <= b'9':
+            result, next_index = decode_string(start_index)
         else:
-            encode_int(0, r)
-            
-    def encode_string(x, r):
-        r.extend((str(len(x)).encode('ascii'), b':', x))
+            raise BencodeDecodeError("got %r expecting beginning of bencoded value" % (first_byte,))
 
-    def encode_list(x, r):
-        r.append(b'l')
-        for i in x:
-            encode_func[type(i)](i, r)
-        r.append(b'e')
+        return result, next_index
 
-    def encode_dict(x,r):
-        r.append(b'd')
-        ilist = x.items()
-        ilist.sort()
-        for k, v in ilist:
-            r.extend((str(len(k)).encode(), b':', k))
-            encode_func[type(v)](v, r)
-        r.append(b'e')
+    def decode_int(start_index):
+        first_digit_index = start_index + 1
+        end_index = data.index(b'e', first_digit_index)
 
-    encode_func = {}
-    encode_func[int] = encode_int
-    encode_func[long] = encode_int
-    encode_func[str] = encode_string
-    encode_func[list] = encode_list
-    encode_func[tuple] = encode_list
-    encode_func[dict] = encode_dict
-    encode_func[bool] = encode_bool
+        first_digit = data[first_digit_index]
 
-    r = []
-    encode_func[type(x)](x, r)
-    return b''.join(r)
+        if first_digit == b'-':
+            if data[first_digit_index + 1] == b'0':
+                raise BencodeDecodeError("unexpected leading zero in negative integer")
+        elif first_digit == b'0' and end_index - first_digit_index > 1:
+            raise BencodeDecodeError("unexpected leading zero in integer")
 
+        value = int(data[first_digit_index:end_index])
+        next_index = end_index + 1
+        return value, next_index
+
+    def decode_string(start_index):
+        colon_index = data.index(b':', start_index)
+
+        if data[start_index] == b'0' and colon_index - start_index > 1:
+            raise BencodeDecodeError("unexpected leading zero in string length")
+
+        value_length = int(data[start_index:colon_index])
+
+        value = data[colon_index:colon_index + value_length]
+
+        if len(value) != value_length:
+            raise BencodeDecodeError(
+                "expected %s bytes for string, but only %s bytes remained" % (value_length, len(value)))
+
+        next_index = colon_index + value_length
+        return value, next_index
+
+    def decode_list(start_index):
+        child_index = start_index + 1
+
+        value = []
+        
+        while data[child_index] != b'e':
+            child_value, child_index = decode_any(child_index)
+            value.append(child_value)
+
+        next_index = child_index + 1
+        return value, next_index
+
+    def decode_dict(start_index):
+        child_index = start_index + 1
+
+        value = {}
+        
+        while data[child_index] != b'e':
+            child_key, child_index = decode_string(child_index)
+            child_value, child_index = decode_any(child_index)
+            value[child_key] = child_value
+
+        next_index = child_index + 1
+        return value, next_index
+
+    result, next_index = decode_any(0)
+
+    extra = len(data) - next_index
+    if extra:
+        raise BencodeDecodeError(
+            "unexpected extra %s bytes (starting with %r) after end of bencoded value" % (
+                extra, data[next_index:next_index + 4]))
+
+    return result
+
+
+class BencodeDecodeError(ValueError):
+    pass
+
+
+def bencode(root_value):
+    pieces = []
+
+    def encode_any(value):
+        if isinstance(value, int):
+            encode_int(value)
+        elif isinstance(value, bytes):
+            encode_string(value)
+        elif isinstance(value, list):
+            encode_list(value)
+        elif isinstance(value, dict):
+            encode_dict(value)
+        else:
+            raise TypeError("cannot bencode value of this type: %r" % (value,))
+
+    def encode_int(value):
+        pieces.append(b'i%de' % (value,))
+
+    def encode_string(value):
+        pieces.append(b'%d:' % (len(value),))
+        pieces.append(value)
+
+    def encode_list(value):
+        pieces.append(b'l')
+        for child_value in value:
+            encode_any(child_value)
+        pieces.append(b'e')
+
+    def encode_dict(value):
+        pieces.append(b'd')
+        value_items = value.items()
+        value_items.sort()
+        for child_key, child_value in value_items:
+            encode_string(child_key)
+            encode_any(child_value)
+        pieces.append(b'e')
+
+    encode_any(root_value)
+
+    return b''.join(pieces)
 
 
 if __name__ == '__main__':
